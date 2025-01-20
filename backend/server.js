@@ -59,51 +59,65 @@ seedDefaultChannels();
 
 // Fetch Videos from YouTube RSS Feeds
 app.get('/fetch-from-rss', async (req, res) => {
-  try {
-    const channels = await Channel.find({});
-    const parser = new xml2js.Parser();
-    const results = [];
+    try {
+      const channels = await Channel.find({});
+      const parser = new xml2js.Parser();
+      const results = [];
 
-    await Promise.all(
-      channels.map(async (channel) => {
-        const rssUrl = `https://www.youtube.com/feeds/videos.xml?channel_id=${channel.channelId}`;
-        console.log(`Fetching RSS feed for channel: ${channel.name}`);
+      await Promise.all(
+        channels.map(async (channel) => {
+          const rssUrl = `https://www.youtube.com/feeds/videos.xml?channel_id=${channel.channelId}`;
+          console.log(`Fetching RSS feed for channel: ${channel.name}`);
 
-        const response = await fetch(rssUrl);
-        if (!response.ok) {
-          console.error(`Failed to fetch RSS for ${channel.name}`);
-          return;
-        }
+          const response = await fetch(rssUrl);
+          if (!response.ok) {
+            console.error(`Failed to fetch RSS for ${channel.name}`);
+            return;
+          }
 
-        const rssData = await response.text();
-        await new Promise((resolve, reject) => {
-          parser.parseString(rssData, (err, result) => {
-            if (err) {
-              return reject(err);
-            }
-            if (result.feed && result.feed.entry) {
-              result.feed.entry.forEach((video) => {
-                results.push({
-                  videoId: video['yt:videoId'][0],
-                  title: video.title[0],
-                  channel: video.author[0].name[0],
+          const rssData = await response.text();
+          await new Promise((resolve, reject) => {
+            parser.parseString(rssData, (err, result) => {
+              if (err) {
+                return reject(err);
+              }
+              if (result.feed && result.feed.entry) {
+                result.feed.entry.forEach((video) => {
+                  results.push({
+                    videoId: video['yt:videoId'][0],
+                    title: video.title[0],
+                    channel: video.author[0].name[0],
+                  });
                 });
-              });
-            }
-            resolve();
+              }
+              resolve();
+            });
           });
-        });
-      })
-    );
+        })
+      );
 
-    await Song.insertMany(results, { ordered: false });
-    console.log('Songs inserted successfully.');
-    res.json({ success: true, added: results.length });
-  } catch (error) {
-    console.error('Error fetching RSS:', error.message);
-    res.status(500).json({ error: 'Failed to fetch videos from RSS feeds.' });
-  }
-});
+      // Insert new songs while ignoring duplicates
+      let insertedCount = 0;
+      for (const song of results) {
+        try {
+          await Song.updateOne(
+            { videoId: song.videoId }, // Check if the videoId already exists
+            { $set: song },            // Update if exists, insert if not
+            { upsert: true }           // Insert only if it doesn't exist
+          );
+          insertedCount++;
+        } catch (err) {
+          console.error(`Failed to insert/update song: ${song.title}`, err.message);
+        }
+      }
+
+      console.log(`${insertedCount} new songs inserted/updated.`);
+      res.json({ success: true, added: insertedCount });
+    } catch (error) {
+      console.error('Error fetching RSS feeds:', error.message);
+      res.status(500).json({ error: 'Failed to fetch videos from RSS feeds.' });
+    }
+  });
 
 // Get a Random Song
 app.get('/random-song', async (req, res) => {
