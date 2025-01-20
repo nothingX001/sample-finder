@@ -45,8 +45,8 @@ function App() {
 
   return (
     <div style={{ textAlign: 'center', margin: '50px' }}>
-      <h1>Sample Finder</h1>
-      <p>Find random YouTube videos from curated channels!</p>
+      <h1>SAMPLE FINDER</h1>
+      <p>Find random samples from curated channels.</p>
 
       {isLoading ? (
         <p>Loading...</p>
