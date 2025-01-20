@@ -71,7 +71,7 @@ function App() {
             <button onClick={copyLinkToClipboard}>Copy Link</button>
           </div>
 
-          <div>Tip: Screen record or convert video to audio for use.</div>
+          <div style={{ marginTop: '20px' }}>Tip: Screen record or convert video to audio for use.</div>
 
           {copyMessage && <p style={{ marginTop: '10px', color: 'green' }}>{copyMessage}</p>}
         </div>
