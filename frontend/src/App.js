@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import './App.css';
 
-// LiteYouTubeEmbed component directly included in App.js
+// LiteYouTubeEmbed component with fixed dimensions
 const LiteYouTubeEmbed = ({ videoId, title }) => {
   const [activated, setActivated] = useState(false);
   const containerRef = useRef(null);
@@ -23,7 +23,15 @@ const LiteYouTubeEmbed = ({ videoId, title }) => {
   return (
     <div 
       ref={containerRef} 
-      className="lite-youtube-embed" 
+      className="lite-youtube-embed"
+      style={{
+        width: '100%',         // Full width of parent container
+        height: '315px',       // Fixed height - standard 16:9 YouTube height
+        position: 'relative',  // For proper positioning of elements
+        overflow: 'hidden',    // Hide overflow
+        cursor: 'pointer',
+        backgroundColor: '#000'
+      }}
       onClick={activatePlayer}
     >
       {!activated ? (
@@ -32,7 +40,14 @@ const LiteYouTubeEmbed = ({ videoId, title }) => {
             className="lite-youtube-thumbnail"
             style={{ 
               backgroundImage: thumbnailLoaded ? `url(${thumbnailUrl})` : 'none',
-              backgroundColor: '#000' 
+              backgroundColor: '#000',
+              position: 'absolute',
+              top: '0',
+              left: '0',
+              bottom: '0',
+              right: '0',
+              backgroundSize: 'cover',
+              backgroundPosition: 'center'
             }}
           >
             <img 
@@ -41,14 +56,40 @@ const LiteYouTubeEmbed = ({ videoId, title }) => {
               style={{ display: 'none' }}
               onLoad={() => setThumbnailLoaded(true)}
             />
-            <div className="lite-youtube-play-button">
+            <div className="lite-youtube-play-button"
+              style={{
+                position: 'absolute',
+                top: '50%',
+                left: '50%',
+                transform: 'translate(-50%, -50%)',
+                width: '68px',
+                height: '48px'
+              }}
+            >
               <svg height="100%" version="1.1" viewBox="0 0 68 48" width="100%">
                 <path className="play-button-bg" d="M66.52,7.74c-0.78-2.93-2.49-5.41-5.42-6.19C55.79,.13,34,0,34,0S12.21,.13,6.9,1.55 C3.97,2.33,2.27,4.81,1.48,7.74C0.06,13.05,0,24,0,24s0.06,10.95,1.48,16.26c0.78,2.93,2.49,5.41,5.42,6.19 C12.21,47.87,34,48,34,48s21.79-0.13,27.1-1.55c2.93-0.78,4.64-3.26,5.42-6.19C67.94,34.95,68,24,68,24S67.94,13.05,66.52,7.74z"></path>
                 <path className="play-button-arrow" d="M 45,24 27,14 27,34"></path>
               </svg>
             </div>
           </div>
-          <div className="lite-youtube-title">{title || ''}</div>
+          <div 
+            className="lite-youtube-title"
+            style={{
+              position: 'absolute',
+              bottom: '0',
+              left: '0',
+              right: '0',
+              padding: '10px',
+              backgroundColor: 'rgba(0,0,0,0.7)',
+              color: '#fff',
+              textAlign: 'left',
+              whiteSpace: 'nowrap',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis'
+            }}
+          >
+            {title || ''}
+          </div>
         </>
       ) : (
         <iframe
@@ -57,6 +98,14 @@ const LiteYouTubeEmbed = ({ videoId, title }) => {
           frameBorder="0"
           allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
           allowFullScreen
+          style={{
+            position: 'absolute',
+            top: '0',
+            left: '0',
+            width: '100%',
+            height: '100%',
+            border: 'none'
+          }}
         ></iframe>
       )}
     </div>
