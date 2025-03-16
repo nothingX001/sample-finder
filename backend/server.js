@@ -4,6 +4,7 @@ const dotenv = require('dotenv');
 const cors = require('cors');
 const fetch = require('node-fetch');
 const xml2js = require('xml2js');
+const cron = require('node-cron');
 
 // Models
 const Channel = require('./models/Channel');
@@ -60,23 +61,25 @@ async function seedDefaultChannels() {
     console.error('Error seeding channels:', err.message);
   }
 }
-seedDefaultChannels();
 
 // Fetch Videos from YouTube RSS Feeds
-app.get('/fetch-from-rss', async (req, res) => {
-    try {
-      const channels = await Channel.find({});
-      const parser = new xml2js.Parser();
-      const results = [];
+async function fetchVideosFromRSS() {
+  try {
+    const channels = await Channel.find({});
+    const parser = new xml2js.Parser();
+    const results = [];
 
-      await Promise.all(
-        channels.map(async (channel) => {
-          const rssUrl = `https://www.youtube.com/feeds/videos.xml?channel_id=${channel.channelId}`;
-          console.log(`Fetching RSS feed for channel: ${channel.name}`);
+    console.log(`Starting to fetch videos from ${channels.length} channels...`);
 
+    await Promise.all(
+      channels.map(async (channel) => {
+        const rssUrl = `https://www.youtube.com/feeds/videos.xml?channel_id=${channel.channelId}`;
+        console.log(`Fetching RSS feed for channel: ${channel.name}`);
+
+        try {
           const response = await fetch(rssUrl);
           if (!response.ok) {
-            console.error(`Failed to fetch RSS for ${channel.name}`);
+            console.error(`Failed to fetch RSS for ${channel.name}: ${response.status}`);
             return;
           }
 
@@ -84,7 +87,8 @@ app.get('/fetch-from-rss', async (req, res) => {
           await new Promise((resolve, reject) => {
             parser.parseString(rssData, (err, result) => {
               if (err) {
-                return reject(err);
+                console.error(`Error parsing RSS for ${channel.name}: ${err.message}`);
+                return resolve(); // Continue with other channels
               }
               if (result.feed && result.feed.entry) {
                 result.feed.entry.forEach((video) => {
@@ -98,37 +102,72 @@ app.get('/fetch-from-rss', async (req, res) => {
               resolve();
             });
           });
-        })
-      );
-
-      // Insert new songs while ignoring duplicates
-      let insertedCount = 0;
-      for (const song of results) {
-        try {
-          await Song.updateOne(
-            { videoId: song.videoId }, // Check if the videoId already exists
-            { $set: song },            // Update if exists, insert if not
-            { upsert: true }           // Insert only if it doesn't exist
-          );
-          insertedCount++;
-        } catch (err) {
-          console.error(`Failed to insert/update song: ${song.title}`, err.message);
+        } catch (error) {
+          console.error(`Error processing channel ${channel.name}: ${error.message}`);
         }
-      }
+      })
+    );
 
-      console.log(`${insertedCount} new songs inserted/updated.`);
-      res.json({ success: true, added: insertedCount });
-    } catch (error) {
-      console.error('Error fetching RSS feeds:', error.message);
-      res.status(500).json({ error: 'Failed to fetch videos from RSS feeds.' });
+    // Insert new songs while ignoring duplicates
+    let insertedCount = 0;
+    for (const song of results) {
+      try {
+        await Song.updateOne(
+          { videoId: song.videoId }, // Check if the videoId already exists
+          { $set: song },            // Update if exists, insert if not
+          { upsert: true }           // Insert only if it doesn't exist
+        );
+        insertedCount++;
+      } catch (err) {
+        console.error(`Failed to insert/update song: ${song.title}, ${err.message}`);
+      }
     }
-  });
+
+    console.log(`${insertedCount} songs processed (new or updated).`);
+    return { success: true, processed: insertedCount };
+  } catch (error) {
+    console.error('Error in fetchVideosFromRSS:', error.message);
+    return { success: false, error: error.message };
+  }
+}
+
+// Initial setup
+async function initialize() {
+  await seedDefaultChannels();
+  await fetchVideosFromRSS();
+}
+
+// Run initialization on startup
+initialize()
+  .then(() => console.log('Initialization completed'))
+  .catch(err => console.error('Initialization failed:', err));
+
+// Schedule regular updates - fetch videos every 6 hours
+cron.schedule('0 */6 * * *', async () => {
+  console.log('Running scheduled video fetch...');
+  await fetchVideosFromRSS();
+  console.log('Scheduled video fetch completed');
+});
+
+// API Endpoints
+app.get('/fetch-from-rss', async (req, res) => {
+  try {
+    const result = await fetchVideosFromRSS();
+    res.json(result);
+  } catch (error) {
+    console.error('Error in fetch-from-rss endpoint:', error.message);
+    res.status(500).json({ error: 'Failed to fetch videos from RSS feeds.' });
+  }
+});
 
 // Get a Random Song
 app.get('/random-song', async (req, res) => {
   try {
     const count = await Song.countDocuments();
-    if (count === 0) return res.json(null);
+    if (count === 0) {
+      console.log('No songs found in database');
+      return res.json(null);
+    }
 
     const randomIndex = Math.floor(Math.random() * count);
     const song = await Song.findOne().skip(randomIndex);
