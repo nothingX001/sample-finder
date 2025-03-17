@@ -29,10 +29,10 @@ const LiteYouTubeEmbed = ({ videoId, title }) => {
       className="lite-youtube-embed"
       style={{
         position: 'relative',
-        height: '180px', // Much smaller height
+        height: '180px',
         width: '100%',
         maxWidth: '600px',
-        paddingBottom: '0', // Override the padding-bottom from CSS
+        paddingBottom: '0',
         overflow: 'hidden',
         cursor: 'pointer',
         backgroundColor: '#000',
@@ -95,8 +95,9 @@ function App() {
   const [isFetching, setIsFetching] = useState(false);
   const backendUrl = process.env.REACT_APP_BACKEND_URL || '';
   const abortControllerRef = useRef(null);
+  const initialLoadCompleteRef = useRef(false);
 
-  // Preload multiple songs instead of just one
+  // Preload songs without displaying them
   const preloadSongs = useCallback(async (count = 3) => {
     try {
       const songs = [];
@@ -114,7 +115,7 @@ function App() {
     }
   }, [backendUrl]);
 
-  // Fetch a random song, prioritizing preloaded songs
+  // Fetch a random song when the user clicks the button
   const fetchRandomSong = useCallback(async () => {
     if (isFetching) return; // Prevent multiple simultaneous requests
     
@@ -135,10 +136,13 @@ function App() {
         setPreloadedSongs(remainingSongs);
         setError(null);
         
-        // If we're running low on preloaded songs, fetch more
+        // If we're running low on preloaded songs, fetch more in the background
         if (remainingSongs.length < 2) {
-          const newSongs = await preloadSongs(3 - remainingSongs.length);
-          setPreloadedSongs([...remainingSongs, ...newSongs]);
+          // Use a separate async operation to avoid affecting the current flow
+          setTimeout(async () => {
+            const newSongs = await preloadSongs(3 - remainingSongs.length);
+            setPreloadedSongs(prev => [...prev, ...newSongs]);
+          }, 100);
         }
       } else {
         // Create a new AbortController for this fetch
@@ -158,9 +162,11 @@ function App() {
           setSong(data);
           setError(null);
           
-          // Preload more songs for future use
-          const newSongs = await preloadSongs(2);
-          setPreloadedSongs(newSongs);
+          // Preload more songs for future use without affecting the current view
+          setTimeout(async () => {
+            const newSongs = await preloadSongs(2);
+            setPreloadedSongs(prev => [...prev, ...newSongs]);
+          }, 100);
         }
       }
     } catch (error) {
@@ -191,22 +197,42 @@ function App() {
     }
   };
 
-  // Initial load - fetch songs and preload more
+  // Initial load - fetch one song only and preload others without displaying them
   useEffect(() => {
+    if (initialLoadCompleteRef.current) return;
+    
     async function initialLoad() {
-      // Preload multiple songs on initial load
-      const initialSongs = await preloadSongs(3);
-      
-      if (initialSongs.length > 0) {
-        const [firstSong, ...restSongs] = initialSongs;
-        setSong(firstSong);
-        setPreloadedSongs(restSongs);
-        setError(null);
-      } else {
-        // If preloading failed, try direct fetch
-        fetchRandomSong();
+      try {
+        setIsFetching(true);
+        setIsLoading(true);
+        
+        // First fetch one song
+        const response = await fetch(`${backendUrl}/random-song`);
+        if (!response.ok) {
+          throw new Error(`HTTP error! status: ${response.status}`);
+        }
+        
+        const data = await response.json();
+        if (!data) {
+          setError('No songs available. Please try again later.');
+        } else {
+          setSong(data);
+          setError(null);
+          
+          // Then preload more songs in the background AFTER displaying the first one
+          setTimeout(async () => {
+            const preloadedSongs = await preloadSongs(3);
+            setPreloadedSongs(preloadedSongs);
+          }, 1000);
+        }
+      } catch (error) {
+        console.error('Error during initial load:', error);
+        setError('Failed to load initial song. Please try again.');
+      } finally {
+        setIsLoading(false);
+        setIsFetching(false);
+        initialLoadCompleteRef.current = true;
       }
-      setIsLoading(false);
     }
     
     initialLoad();
@@ -217,7 +243,7 @@ function App() {
         abortControllerRef.current.abort();
       }
     };
-  }, [fetchRandomSong, preloadSongs]);
+  }, [backendUrl, preloadSongs]);
 
   return (
     <div className="App">
