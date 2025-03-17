@@ -1,14 +1,13 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import './App.css';
 
-// LiteYouTubeEmbed component with SMALLER fixed dimensions
+// LiteYouTubeEmbed component with optimized loading
 const LiteYouTubeEmbed = ({ videoId, title }) => {
   const [activated, setActivated] = useState(false);
-  const containerRef = useRef(null);
   const [thumbnailLoaded, setThumbnailLoaded] = useState(false);
-
-  // Generate YouTube thumbnail URL
-  const thumbnailUrl = `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
+  
+  // Generate YouTube thumbnail URL - use webp for faster loading
+  const thumbnailUrl = `https://i.ytimg.com/vi_webp/${videoId}/mqdefault.webp`;
 
   const activatePlayer = () => {
     setActivated(true);
@@ -18,11 +17,15 @@ const LiteYouTubeEmbed = ({ videoId, title }) => {
     // Reset state when videoId changes
     setActivated(false);
     setThumbnailLoaded(false);
-  }, [videoId]);
+    
+    // Preload the thumbnail image
+    const img = new Image();
+    img.src = thumbnailUrl;
+    img.onload = () => setThumbnailLoaded(true);
+  }, [videoId, thumbnailUrl]);
 
   return (
     <div 
-      ref={containerRef} 
       className="lite-youtube-embed"
       style={{
         position: 'relative',
@@ -36,6 +39,7 @@ const LiteYouTubeEmbed = ({ videoId, title }) => {
         margin: '1rem auto'
       }}
       onClick={activatePlayer}
+      aria-label={`Play: ${title || 'YouTube Video'}`}
     >
       {!activated ? (
         <>
@@ -47,12 +51,9 @@ const LiteYouTubeEmbed = ({ videoId, title }) => {
               backgroundSize: 'cover'
             }}
           >
-            <img 
-              src={thumbnailUrl} 
-              alt={title || 'YouTube Video'} 
-              style={{ display: 'none' }}
-              onLoad={() => setThumbnailLoaded(true)}
-            />
+            {!thumbnailLoaded && (
+              <div className="loading-spinner" style={{ position: 'absolute', top: '50%', left: '50%', transform: 'translate(-50%, -50%)' }}></div>
+            )}
             <div className="lite-youtube-play-button">
               <svg height="100%" version="1.1" viewBox="0 0 68 48" width="100%">
                 <path className="play-button-bg" d="M66.52,7.74c-0.78-2.93-2.49-5.41-5.42-6.19C55.79,.13,34,0,34,0S12.21,.13,6.9,1.55 C3.97,2.33,2.27,4.81,1.48,7.74C0.06,13.05,0,24,0,24s0.06,10.95,1.48,16.26c0.78,2.93,2.49,5.41,5.42,6.19 C12.21,47.87,34,48,34,48s21.79-0.13,27.1-1.55c2.93-0.78,4.64-3.26,5.42-6.19C67.94,34.95,68,24,68,24S67.94,13.05,66.52,7.74z"></path>
@@ -66,7 +67,7 @@ const LiteYouTubeEmbed = ({ videoId, title }) => {
         </>
       ) : (
         <iframe
-          src={`https://www.youtube.com/embed/${videoId}?autoplay=1`}
+          src={`https://www.youtube.com/embed/${videoId}?autoplay=1&rel=0`}
           title={title || 'YouTube Video'}
           frameBorder="0"
           allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
@@ -89,28 +90,63 @@ function App() {
   const [song, setSong] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
   const [copyMessage, setCopyMessage] = useState('');
-  const [preloadedSong, setPreloadedSong] = useState(null);
+  const [preloadedSongs, setPreloadedSongs] = useState([]);
   const [error, setError] = useState(null);
   const [isFetching, setIsFetching] = useState(false);
+  const backendUrl = process.env.REACT_APP_BACKEND_URL || '';
+  const abortControllerRef = useRef(null);
 
-  // Fetch a random song from the backend
-  const fetchRandomSong = async () => {
+  // Preload multiple songs instead of just one
+  const preloadSongs = useCallback(async (count = 3) => {
+    try {
+      const songs = [];
+      for (let i = 0; i < count; i++) {
+        const response = await fetch(`${backendUrl}/random-song`);
+        if (response.ok) {
+          const data = await response.json();
+          if (data) songs.push(data);
+        }
+      }
+      return songs;
+    } catch (error) {
+      console.error('Error preloading songs:', error);
+      return [];
+    }
+  }, [backendUrl]);
+
+  // Fetch a random song, prioritizing preloaded songs
+  const fetchRandomSong = useCallback(async () => {
     if (isFetching) return; // Prevent multiple simultaneous requests
     
     try {
+      // Cancel any ongoing fetch
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+      }
+      
       setIsFetching(true);
       setIsLoading(true);
       
-      // Use the preloaded song if available
-      if (preloadedSong) {
-        setSong(preloadedSong);
-        setPreloadedSong(null);
+      // Use a preloaded song if available
+      if (preloadedSongs.length > 0) {
+        const nextSong = preloadedSongs[0];
+        const remainingSongs = preloadedSongs.slice(1);
+        setSong(nextSong);
+        setPreloadedSongs(remainingSongs);
         setError(null);
         
-        // Immediately start preloading the next song
-        fetchNextSong();
+        // If we're running low on preloaded songs, fetch more
+        if (remainingSongs.length < 2) {
+          const newSongs = await preloadSongs(3 - remainingSongs.length);
+          setPreloadedSongs([...remainingSongs, ...newSongs]);
+        }
       } else {
-        const response = await fetch(`${process.env.REACT_APP_BACKEND_URL}/random-song`);
+        // Create a new AbortController for this fetch
+        abortControllerRef.current = new AbortController();
+        const { signal } = abortControllerRef.current;
+        
+        // Fetch a new song directly
+        const response = await fetch(`${backendUrl}/random-song`, { signal });
         if (!response.ok) {
           throw new Error(`HTTP error! status: ${response.status}`);
         }
@@ -122,34 +158,22 @@ function App() {
           setSong(data);
           setError(null);
           
-          // Preload next song after current one is loaded
-          fetchNextSong();
+          // Preload more songs for future use
+          const newSongs = await preloadSongs(2);
+          setPreloadedSongs(newSongs);
         }
       }
     } catch (error) {
-      console.error('Error fetching random song:', error);
-      setError('Failed to load song. Please try again.');
+      // Ignore AbortError as it's intentional
+      if (error.name !== 'AbortError') {
+        console.error('Error fetching random song:', error);
+        setError('Failed to load song. Please try again.');
+      }
     } finally {
       setIsLoading(false);
       setIsFetching(false);
     }
-  };
-
-  // Preload the next song
-  const fetchNextSong = async () => {
-    try {
-      const response = await fetch(`${process.env.REACT_APP_BACKEND_URL}/random-song`);
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
-      }
-      const data = await response.json();
-      if (data) {
-        setPreloadedSong(data);
-      }
-    } catch (error) {
-      console.error('Error preloading next song:', error);
-    }
-  };
+  }, [isFetching, preloadedSongs, backendUrl, preloadSongs]);
 
   // Copy the YouTube link to clipboard
   const copyLinkToClipboard = async () => {
@@ -167,14 +191,33 @@ function App() {
     }
   };
 
+  // Initial load - fetch songs and preload more
   useEffect(() => {
-    fetchRandomSong();
+    async function initialLoad() {
+      // Preload multiple songs on initial load
+      const initialSongs = await preloadSongs(3);
+      
+      if (initialSongs.length > 0) {
+        const [firstSong, ...restSongs] = initialSongs;
+        setSong(firstSong);
+        setPreloadedSongs(restSongs);
+        setError(null);
+      } else {
+        // If preloading failed, try direct fetch
+        fetchRandomSong();
+      }
+      setIsLoading(false);
+    }
+    
+    initialLoad();
     
     // Cleanup function
     return () => {
-      // Cancel any pending state updates
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+      }
     };
-  }, []);
+  }, [fetchRandomSong, preloadSongs]);
 
   return (
     <div className="App">
@@ -212,10 +255,11 @@ function App() {
               <button 
                 onClick={fetchRandomSong} 
                 disabled={isFetching}
+                className="primary-button"
               >
                 {isFetching ? 'Loading...' : 'Find New Sample'}
               </button>
-              <button onClick={copyLinkToClipboard}>
+              <button onClick={copyLinkToClipboard} className="secondary-button">
                 Copy Link
               </button>
             </div>

@@ -5,6 +5,7 @@ const cors = require('cors');
 const fetch = require('node-fetch');
 const xml2js = require('xml2js');
 const cron = require('node-cron');
+const NodeCache = require('node-cache'); // You'll need to install this: npm install node-cache
 
 // Models
 const Channel = require('./models/Channel');
@@ -16,21 +17,41 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 const MONGODB_URI = process.env.MONGODB_URI;
 
+// Initialize cache with 30 minute TTL
+const songCache = new NodeCache({ stdTTL: 1800, checkperiod: 600 });
+const CACHE_KEY_SONG_IDS = 'all_song_ids';
+const CACHE_KEY_RANDOM_SONGS = 'random_songs';
+const CACHE_SIZE = 50; // Number of random songs to keep cached
+
 app.use(cors());
 app.use(express.json());
 
-// Connect to MongoDB
+// Add request timeout middleware
+app.use((req, res, next) => {
+  res.setTimeout(10000, () => {
+    res.status(408).send('Request Timeout');
+  });
+  next();
+});
+
+// MongoDB connection with optimized settings
 mongoose
   .connect(MONGODB_URI, {
     useNewUrlParser: true,
     useUnifiedTopology: true,
-    serverSelectionTimeoutMS: 30000, // Wait up to 30 seconds
-    socketTimeoutMS: 45000,         // Keep socket open for 45 seconds
+    serverSelectionTimeoutMS: 15000, // Reduced from 30s to 15s
+    socketTimeoutMS: 30000,          // Reduced from 45s to 30s
+    poolSize: 10,                   // Maintain up to 10 socket connections
+    heartbeatFrequencyMS: 30000,    // Check server status every 30 seconds
   })
-  .then(() => console.log('Connected to MongoDB'))
+  .then(() => {
+    console.log('Connected to MongoDB');
+    // Populate cache after connection
+    populateSongCache();
+  })
   .catch((err) => console.error('MongoDB connection error:', err));
 
-// Default YouTube Channels
+// Default YouTube Channels - unchanged from your original code
 const DEFAULT_CHANNELS = [
   { channelId: 'UCXxNR5OIs52ZQUDc9RlAing', name: 'Channel 1' },
   { channelId: 'UCY8_y20lxQhhBe8GZl5A9rw', name: 'Channel 2' },
@@ -48,7 +69,25 @@ const DEFAULT_CHANNELS = [
   { channelId: 'UCtrJ2-RStj9rX6SOGzv7ybA', name: 'Channel 15' },
 ];
 
-// Seed Default Channels
+// Populate song cache to improve random song performance
+async function populateSongCache() {
+  try {
+    console.log('Populating song cache...');
+    
+    // Get all song IDs and cache them
+    const songIds = await Song.find({}, '_id').lean();
+    songCache.set(CACHE_KEY_SONG_IDS, songIds.map(song => song._id.toString()));
+    
+    // Pre-cache some random songs for immediate access
+    await cacheRandomSongs(CACHE_SIZE);
+    
+    console.log(`Song cache populated with ${songIds.length} songs`);
+  } catch (err) {
+    console.error('Error populating song cache:', err.message);
+  }
+}
+
+// Seed Default Channels - unchanged from your original code
 async function seedDefaultChannels() {
   try {
     const existingChannels = await Channel.countDocuments();
@@ -62,69 +101,131 @@ async function seedDefaultChannels() {
   }
 }
 
-// Fetch Videos from YouTube RSS Feeds
+// Cache a batch of random songs for quick access
+async function cacheRandomSongs(count) {
+  try {
+    const songIds = songCache.get(CACHE_KEY_SONG_IDS);
+    if (!songIds || songIds.length === 0) {
+      console.log('No song IDs in cache to generate random songs');
+      return;
+    }
+    
+    const randomSongs = [];
+    const usedIndexes = new Set();
+    
+    // Get 'count' random songs
+    for (let i = 0; i < Math.min(count, songIds.length); i++) {
+      let randomIndex;
+      do {
+        randomIndex = Math.floor(Math.random() * songIds.length);
+      } while (usedIndexes.has(randomIndex) && usedIndexes.size < songIds.length);
+      
+      usedIndexes.add(randomIndex);
+      const songId = songIds[randomIndex];
+      
+      if (songId) {
+        const song = await Song.findById(songId).lean();
+        if (song) {
+          randomSongs.push(song);
+        }
+      }
+    }
+    
+    songCache.set(CACHE_KEY_RANDOM_SONGS, randomSongs);
+    console.log(`Cached ${randomSongs.length} random songs`);
+  } catch (err) {
+    console.error('Error caching random songs:', err.message);
+  }
+}
+
+// Fetch Videos from YouTube RSS Feeds - optimized with Promise.allSettled
 async function fetchVideosFromRSS() {
   try {
-    const channels = await Channel.find({});
+    const channels = await Channel.find({}).lean();
     const parser = new xml2js.Parser();
     const results = [];
 
     console.log(`Starting to fetch videos from ${channels.length} channels...`);
 
-    await Promise.all(
-      channels.map(async (channel) => {
-        const rssUrl = `https://www.youtube.com/feeds/videos.xml?channel_id=${channel.channelId}`;
-        console.log(`Fetching RSS feed for channel: ${channel.name}`);
+    // Use Promise.allSettled to prevent a single failure from stopping all fetches
+    const fetchPromises = channels.map(async (channel) => {
+      const rssUrl = `https://www.youtube.com/feeds/videos.xml?channel_id=${channel.channelId}`;
+      console.log(`Fetching RSS feed for channel: ${channel.name}`);
 
-        try {
-          const response = await fetch(rssUrl);
-          if (!response.ok) {
-            console.error(`Failed to fetch RSS for ${channel.name}: ${response.status}`);
-            return;
-          }
-
-          const rssData = await response.text();
-          await new Promise((resolve, reject) => {
-            parser.parseString(rssData, (err, result) => {
-              if (err) {
-                console.error(`Error parsing RSS for ${channel.name}: ${err.message}`);
-                return resolve(); // Continue with other channels
-              }
-              if (result.feed && result.feed.entry) {
-                result.feed.entry.forEach((video) => {
-                  results.push({
-                    videoId: video['yt:videoId'][0],
-                    title: video.title[0],
-                    channel: video.author[0].name[0],
-                  });
-                });
-              }
-              resolve();
-            });
-          });
-        } catch (error) {
-          console.error(`Error processing channel ${channel.name}: ${error.message}`);
-        }
-      })
-    );
-
-    // Insert new songs while ignoring duplicates
-    let insertedCount = 0;
-    for (const song of results) {
       try {
-        await Song.updateOne(
-          { videoId: song.videoId }, // Check if the videoId already exists
-          { $set: song },            // Update if exists, insert if not
-          { upsert: true }           // Insert only if it doesn't exist
-        );
-        insertedCount++;
-      } catch (err) {
-        console.error(`Failed to insert/update song: ${song.title}, ${err.message}`);
+        // Set timeout for fetch to avoid hanging
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 5000);
+        
+        const response = await fetch(rssUrl, { 
+          signal: controller.signal,
+          headers: { 'User-Agent': 'Sample Finder App/1.0' }
+        });
+        clearTimeout(timeout);
+        
+        if (!response.ok) {
+          console.error(`Failed to fetch RSS for ${channel.name}: ${response.status}`);
+          return [];
+        }
+
+        const rssData = await response.text();
+        return new Promise((resolve) => {
+          parser.parseString(rssData, (err, result) => {
+            if (err) {
+              console.error(`Error parsing RSS for ${channel.name}: ${err.message}`);
+              return resolve([]);
+            }
+            
+            const videos = [];
+            if (result.feed && result.feed.entry) {
+              result.feed.entry.forEach((video) => {
+                videos.push({
+                  videoId: video['yt:videoId'][0],
+                  title: video.title[0],
+                  channel: video.author[0].name[0],
+                });
+              });
+            }
+            resolve(videos);
+          });
+        });
+      } catch (error) {
+        console.error(`Error processing channel ${channel.name}: ${error.message}`);
+        return [];
       }
+    });
+
+    const settledPromises = await Promise.allSettled(fetchPromises);
+    settledPromises.forEach(promise => {
+      if (promise.status === 'fulfilled') {
+        results.push(...promise.value);
+      }
+    });
+
+    // Use bulk operations for better performance
+    if (results.length > 0) {
+      const operations = results.map(song => ({
+        updateOne: {
+          filter: { videoId: song.videoId },
+          update: { $set: song },
+          upsert: true
+        }
+      }));
+      
+      const bulkResult = await Song.bulkWrite(operations);
+      console.log(`${bulkResult.upsertedCount} new songs inserted, ${bulkResult.modifiedCount} songs updated`);
+      
+      // Update the cache after insertion
+      await populateSongCache();
+      
+      return { 
+        success: true, 
+        inserted: bulkResult.upsertedCount, 
+        updated: bulkResult.modifiedCount 
+      };
     }
 
-    console.log(`${insertedCount} songs processed (new or updated).`);
-    return { success: true, processed: insertedCount };
+    return { success: true, processed: 0 };
   } catch (error) {
     console.error('Error in fetchVideosFromRSS:', error.message);
     return { success: false, error: error.message };
@@ -141,6 +242,12 @@ async function initialize() {
 initialize()
   .then(() => console.log('Initialization completed'))
   .catch(err => console.error('Initialization failed:', err));
+
+// Schedule cache refresh - every hour
+cron.schedule('0 * * * *', async () => {
+  console.log('Running scheduled cache refresh...');
+  await populateSongCache();
+});
 
 // Schedule regular updates - fetch videos every 6 hours
 cron.schedule('0 */6 * * *', async () => {
@@ -160,9 +267,26 @@ app.get('/fetch-from-rss', async (req, res) => {
   }
 });
 
-// Get a Random Song
+// Get a Random Song - with caching
 app.get('/random-song', async (req, res) => {
   try {
+    // Try to get a pre-cached random song
+    const cachedRandomSongs = songCache.get(CACHE_KEY_RANDOM_SONGS);
+    
+    if (cachedRandomSongs && cachedRandomSongs.length > 0) {
+      // Get and remove one song from the cache
+      const randomSong = cachedRandomSongs.shift();
+      songCache.set(CACHE_KEY_RANDOM_SONGS, cachedRandomSongs);
+      
+      // If cache is running low, refresh it asynchronously
+      if (cachedRandomSongs.length < 10) {
+        cacheRandomSongs(CACHE_SIZE - cachedRandomSongs.length).catch(console.error);
+      }
+      
+      return res.json(randomSong);
+    } 
+    
+    // Fallback to database query if cache is empty
     const count = await Song.countDocuments();
     if (count === 0) {
       console.log('No songs found in database');
@@ -170,12 +294,27 @@ app.get('/random-song', async (req, res) => {
     }
 
     const randomIndex = Math.floor(Math.random() * count);
-    const song = await Song.findOne().skip(randomIndex);
+    const song = await Song.findOne().skip(randomIndex).lean();
     res.json(song);
+    
+    // Refill the cache asynchronously
+    cacheRandomSongs(CACHE_SIZE).catch(console.error);
   } catch (error) {
     console.error('Error fetching random song:', error.message);
     res.status(500).json({ error: 'Failed to fetch a random song.' });
   }
+});
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    cacheStatus: {
+      songIds: songCache.has(CACHE_KEY_SONG_IDS),
+      randomSongs: songCache.has(CACHE_KEY_RANDOM_SONGS) ? 
+        songCache.get(CACHE_KEY_RANDOM_SONGS).length : 0
+    }
+  });
 });
 
 // Root Route
@@ -187,3 +326,5 @@ app.get('/', (req, res) => {
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
 });
+
+module.exports = app; // Export for testing purposes
