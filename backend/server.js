@@ -17,11 +17,13 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 const MONGODB_URI = process.env.MONGODB_URI;
 
-// Initialize cache with 30 minute TTL
+// Enhanced caching configuration
 const songCache = new NodeCache({ stdTTL: 1800, checkperiod: 600 });
 const CACHE_KEY_SONG_IDS = 'all_song_ids';
 const CACHE_KEY_RANDOM_SONGS = 'random_songs';
-const CACHE_SIZE = 50; // Number of random songs to keep cached
+const CACHE_KEY_FEATURED_SONGS = 'featured_songs'; // New cache for featured/high-quality songs
+const CACHE_SIZE = 100; // Increased from 50 to 100
+const FEATURED_CACHE_SIZE = 30; // Songs that will load instantly for first-time users
 
 app.use(cors());
 app.use(express.json());
@@ -69,7 +71,7 @@ const DEFAULT_CHANNELS = [
   { channelId: 'UCtrJ2-RStj9rX6SOGzv7ybA', name: 'Channel 15' },
 ];
 
-// Populate song cache to improve random song performance
+// Improved song cache population with tiered caching
 async function populateSongCache() {
   try {
     console.log('Populating song cache...');
@@ -78,10 +80,13 @@ async function populateSongCache() {
     const songIds = await Song.find({}, '_id').lean();
     songCache.set(CACHE_KEY_SONG_IDS, songIds.map(song => song._id.toString()));
     
-    // Pre-cache some random songs for immediate access
+    // Pre-cache a larger set of random songs for immediate access
     await cacheRandomSongs(CACHE_SIZE);
     
-    console.log(`Song cache populated with ${songIds.length} songs`);
+    // Pre-cache featured songs (could be based on popularity, quality, or other criteria)
+    await cacheFeaturedSongs(FEATURED_CACHE_SIZE);
+    
+    console.log(`Song cache populated with ${songIds.length} songs, ${CACHE_SIZE} random songs, and ${FEATURED_CACHE_SIZE} featured songs`);
   } catch (err) {
     console.error('Error populating song cache:', err.message);
   }
@@ -135,6 +140,47 @@ async function cacheRandomSongs(count) {
     console.log(`Cached ${randomSongs.length} random songs`);
   } catch (err) {
     console.error('Error caching random songs:', err.message);
+  }
+}
+
+// New function to cache featured/high-quality songs for instant loading
+async function cacheFeaturedSongs(count) {
+  try {
+    // This could be modified to select songs based on popularity, quality, or other criteria
+    // For now, we'll just select a different set of random songs
+    const songIds = songCache.get(CACHE_KEY_SONG_IDS);
+    if (!songIds || songIds.length === 0) {
+      console.log('No song IDs in cache to generate featured songs');
+      return;
+    }
+    
+    const featuredSongs = [];
+    const usedIndexes = new Set();
+    
+    // Get 'count' featured songs with prioritized loading
+    for (let i = 0; i < Math.min(count, songIds.length); i++) {
+      let randomIndex;
+      do {
+        randomIndex = Math.floor(Math.random() * songIds.length);
+      } while (usedIndexes.has(randomIndex) && usedIndexes.size < songIds.length);
+      
+      usedIndexes.add(randomIndex);
+      const songId = songIds[randomIndex];
+      
+      if (songId) {
+        const song = await Song.findById(songId).lean();
+        if (song) {
+          // Add a flag to indicate this is a featured/priority song
+          song.featured = true;
+          featuredSongs.push(song);
+        }
+      }
+    }
+    
+    songCache.set(CACHE_KEY_FEATURED_SONGS, featuredSongs);
+    console.log(`Cached ${featuredSongs.length} featured songs for instant loading`);
+  } catch (err) {
+    console.error('Error caching featured songs:', err.message);
   }
 }
 
@@ -238,13 +284,17 @@ async function initialize() {
   await fetchVideosFromRSS();
 }
 
-// Run initialization on startup
+// Run initialization on startup with immediate cache population
 initialize()
-  .then(() => console.log('Initialization completed'))
+  .then(() => {
+    console.log('Initialization completed');
+    // Force an immediate cache refresh to ensure data is ready
+    populateSongCache();
+  })
   .catch(err => console.error('Initialization failed:', err));
 
-// Schedule cache refresh - every hour
-cron.schedule('0 * * * *', async () => {
+// Schedule more frequent cache refreshes - every 30 minutes instead of hourly
+cron.schedule('*/30 * * * *', async () => {
   console.log('Running scheduled cache refresh...');
   await populateSongCache();
 });
@@ -267,10 +317,31 @@ app.get('/fetch-from-rss', async (req, res) => {
   }
 });
 
-// Get a Random Song - with caching
+// Enhanced random song endpoint with tiered caching approach
 app.get('/random-song', async (req, res) => {
   try {
-    // Try to get a pre-cached random song
+    // Check if client wants a featured song (will be used for initial loads)
+    const wantsFeatured = req.query.featured === 'true';
+    
+    if (wantsFeatured) {
+      // Try to get a pre-cached featured song for instant loading
+      const featuredSongs = songCache.get(CACHE_KEY_FEATURED_SONGS);
+      
+      if (featuredSongs && featuredSongs.length > 0) {
+        // Get and remove one song from the featured cache
+        const featuredSong = featuredSongs.shift();
+        songCache.set(CACHE_KEY_FEATURED_SONGS, featuredSongs);
+        
+        // If featured cache is running low, refresh it asynchronously
+        if (featuredSongs.length < 10) {
+          cacheFeaturedSongs(FEATURED_CACHE_SIZE - featuredSongs.length).catch(console.error);
+        }
+        
+        return res.json(featuredSong);
+      }
+    }
+    
+    // Otherwise proceed with regular random songs from cache
     const cachedRandomSongs = songCache.get(CACHE_KEY_RANDOM_SONGS);
     
     if (cachedRandomSongs && cachedRandomSongs.length > 0) {
@@ -279,7 +350,7 @@ app.get('/random-song', async (req, res) => {
       songCache.set(CACHE_KEY_RANDOM_SONGS, cachedRandomSongs);
       
       // If cache is running low, refresh it asynchronously
-      if (cachedRandomSongs.length < 10) {
+      if (cachedRandomSongs.length < 20) { // Increased threshold from 10 to 20
         cacheRandomSongs(CACHE_SIZE - cachedRandomSongs.length).catch(console.error);
       }
       
@@ -297,22 +368,28 @@ app.get('/random-song', async (req, res) => {
     const song = await Song.findOne().skip(randomIndex).lean();
     res.json(song);
     
-    // Refill the cache asynchronously
-    cacheRandomSongs(CACHE_SIZE).catch(console.error);
+    // Refill both caches asynchronously
+    Promise.all([
+      cacheRandomSongs(CACHE_SIZE).catch(console.error),
+      cacheFeaturedSongs(FEATURED_CACHE_SIZE).catch(console.error)
+    ]);
   } catch (error) {
     console.error('Error fetching random song:', error.message);
     res.status(500).json({ error: 'Failed to fetch a random song.' });
   }
 });
 
-// Health check endpoint
+// Health check endpoint with more detailed cache info
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
     cacheStatus: {
-      songIds: songCache.has(CACHE_KEY_SONG_IDS),
+      songIds: songCache.has(CACHE_KEY_SONG_IDS) ? 
+        songCache.get(CACHE_KEY_SONG_IDS).length : 0,
       randomSongs: songCache.has(CACHE_KEY_RANDOM_SONGS) ? 
-        songCache.get(CACHE_KEY_RANDOM_SONGS).length : 0
+        songCache.get(CACHE_KEY_RANDOM_SONGS).length : 0,
+      featuredSongs: songCache.has(CACHE_KEY_FEATURED_SONGS) ? 
+        songCache.get(CACHE_KEY_FEATURED_SONGS).length : 0
     }
   });
 });

@@ -91,18 +91,29 @@ function App() {
   const [isLoading, setIsLoading] = useState(true);
   const [copyMessage, setCopyMessage] = useState('');
   const [preloadedSongs, setPreloadedSongs] = useState([]);
+  const [featuredSongs, setFeaturedSongs] = useState([]);
   const [error, setError] = useState(null);
   const [isFetching, setIsFetching] = useState(false);
   const backendUrl = process.env.REACT_APP_BACKEND_URL || '';
   const abortControllerRef = useRef(null);
   const initialLoadCompleteRef = useRef(false);
+  const preloadInProgressRef = useRef(false);
 
-  // Preload songs without displaying them
-  const preloadSongs = useCallback(async (count = 3) => {
+  // Enhanced preload function that can load both regular and featured songs
+  const preloadSongs = useCallback(async (count = 5, featured = false) => {
+    // Avoid multiple simultaneous preload operations
+    if (preloadInProgressRef.current) return [];
+    
+    preloadInProgressRef.current = true;
     try {
       const songs = [];
       for (let i = 0; i < count; i++) {
-        const response = await fetch(`${backendUrl}/random-song`);
+        // Add featured parameter to URL if requesting featured songs
+        const url = featured 
+          ? `${backendUrl}/random-song?featured=true` 
+          : `${backendUrl}/random-song`;
+          
+        const response = await fetch(url);
         if (response.ok) {
           const data = await response.json();
           if (data) songs.push(data);
@@ -110,10 +121,30 @@ function App() {
       }
       return songs;
     } catch (error) {
-      console.error('Error preloading songs:', error);
+      console.error(`Error preloading ${featured ? 'featured' : 'regular'} songs:`, error);
       return [];
+    } finally {
+      preloadInProgressRef.current = false;
     }
   }, [backendUrl]);
+
+  // Aggressively preload songs in the background
+  const backgroundPreload = useCallback(async () => {
+    try {
+      // Preload both regular and featured songs
+      const [regularSongs, newFeaturedSongs] = await Promise.all([
+        preloadSongs(5, false),
+        preloadSongs(3, true)
+      ]);
+      
+      setPreloadedSongs(prev => [...prev, ...regularSongs]);
+      setFeaturedSongs(prev => [...prev, ...newFeaturedSongs]);
+      
+      console.log(`Background preloaded ${regularSongs.length} regular and ${newFeaturedSongs.length} featured songs`);
+    } catch (error) {
+      console.error('Error during background preload:', error);
+    }
+  }, [preloadSongs]);
 
   // Fetch a random song when the user clicks the button
   const fetchRandomSong = useCallback(async () => {
@@ -128,46 +159,37 @@ function App() {
       setIsFetching(true);
       setIsLoading(true);
       
-      // Use a preloaded song if available
-      if (preloadedSongs.length > 0) {
-        const nextSong = preloadedSongs[0];
-        const remainingSongs = preloadedSongs.slice(1);
-        setSong(nextSong);
-        setPreloadedSongs(remainingSongs);
-        setError(null);
-        
-        // If we're running low on preloaded songs, fetch more in the background
-        if (remainingSongs.length < 2) {
-          // Use a separate async operation to avoid affecting the current flow
-          setTimeout(async () => {
-            const newSongs = await preloadSongs(3 - remainingSongs.length);
-            setPreloadedSongs(prev => [...prev, ...newSongs]);
-          }, 100);
-        }
+      // Priority order: featured songs > preloaded songs > direct fetch
+      let nextSong = null;
+      
+      if (featuredSongs.length > 0) {
+        // Use a featured song for immediate response
+        nextSong = featuredSongs[0];
+        setFeaturedSongs(featuredSongs.slice(1));
+      } else if (preloadedSongs.length > 0) {
+        // Use a preloaded song
+        nextSong = preloadedSongs[0];
+        setPreloadedSongs(preloadedSongs.slice(1));
       } else {
-        // Create a new AbortController for this fetch
+        // Direct fetch as last resort
         abortControllerRef.current = new AbortController();
         const { signal } = abortControllerRef.current;
         
-        // Fetch a new song directly
         const response = await fetch(`${backendUrl}/random-song`, { signal });
         if (!response.ok) {
           throw new Error(`HTTP error! status: ${response.status}`);
         }
-        const data = await response.json();
+        nextSong = await response.json();
+      }
+      
+      if (!nextSong) {
+        setError('No songs available. Please try again later.');
+      } else {
+        setSong(nextSong);
+        setError(null);
         
-        if (!data) {
-          setError('No songs available. Please try again later.');
-        } else {
-          setSong(data);
-          setError(null);
-          
-          // Preload more songs for future use without affecting the current view
-          setTimeout(async () => {
-            const newSongs = await preloadSongs(2);
-            setPreloadedSongs(prev => [...prev, ...newSongs]);
-          }, 100);
-        }
+        // Always trigger background preload after using a song
+        setTimeout(backgroundPreload, 100);
       }
     } catch (error) {
       // Ignore AbortError as it's intentional
@@ -179,7 +201,7 @@ function App() {
       setIsLoading(false);
       setIsFetching(false);
     }
-  }, [isFetching, preloadedSongs, backendUrl, preloadSongs]);
+  }, [isFetching, preloadedSongs, featuredSongs, backendUrl, backgroundPreload]);
 
   // Copy the YouTube link to clipboard
   const copyLinkToClipboard = async () => {
@@ -197,7 +219,7 @@ function App() {
     }
   };
 
-  // Initial load - fetch one song only and preload others without displaying them
+  // Improved initial load - prioritize featured songs for instant experience
   useEffect(() => {
     if (initialLoadCompleteRef.current) return;
     
@@ -206,25 +228,42 @@ function App() {
         setIsFetching(true);
         setIsLoading(true);
         
-        // First fetch one song
-        const response = await fetch(`${backendUrl}/random-song`);
+        // First try to fetch a featured song for instant loading
+        const response = await fetch(`${backendUrl}/random-song?featured=true`);
         if (!response.ok) {
           throw new Error(`HTTP error! status: ${response.status}`);
         }
         
         const data = await response.json();
         if (!data) {
-          setError('No songs available. Please try again later.');
+          // Fallback to regular song if no featured songs available
+          const regularResponse = await fetch(`${backendUrl}/random-song`);
+          if (!regularResponse.ok) {
+            throw new Error(`HTTP error! status: ${regularResponse.status}`);
+          }
+          const regularData = await regularResponse.json();
+          if (!regularData) {
+            setError('No songs available. Please try again later.');
+          } else {
+            setSong(regularData);
+            setError(null);
+          }
         } else {
           setSong(data);
           setError(null);
-          
-          // Then preload more songs in the background AFTER displaying the first one
-          setTimeout(async () => {
-            const preloadedSongs = await preloadSongs(3);
-            setPreloadedSongs(preloadedSongs);
-          }, 1000);
         }
+        
+        // Start aggressive background preloading as soon as the first song is displayed
+        // Use a short timeout to ensure it doesn't block the UI
+        setTimeout(async () => {
+          await backgroundPreload();
+          
+          // Set up periodic background preloading to keep the caches full
+          const intervalId = setInterval(backgroundPreload, 30000); // Every 30 seconds
+          
+          // Clean up interval on component unmount
+          return () => clearInterval(intervalId);
+        }, 500);
       } catch (error) {
         console.error('Error during initial load:', error);
         setError('Failed to load initial song. Please try again.');
@@ -243,7 +282,7 @@ function App() {
         abortControllerRef.current.abort();
       }
     };
-  }, [backendUrl, preloadSongs]);
+  }, [backendUrl, backgroundPreload]);
 
   return (
     <div className="App">
